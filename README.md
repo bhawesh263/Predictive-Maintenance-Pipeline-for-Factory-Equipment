@@ -172,15 +172,5 @@ azure/                        # real Azure artifacts, ready to deploy
   adf/pipeline_notes.md
 ```
 
-## Interview talking points (prep these, don't memorize word-for-word)
 
-- Why IoT Hub over raw MQTT/REST ingestion (device identity, built-in retry/backoff, per-device auth)
-- Why two Stream Analytics outputs instead of one (different latency/consumption needs for alerts vs. history)
-- What the late-arriving-event tolerance setting does and what you observed building the local emulator
-- Why a Delta-style merge instead of overwrite for the gold table (idempotent reruns)
-- Why schema validation lives in the orchestration layer, not the streaming layer
-- What you'd do differently at real production scale (partitioning strategy, cost of
-  Databricks always-on clusters, using Azure Monitor for pipeline observability)
 
-Be ready to say plainly: this is a self-directed learning project, not professional
-experience — and that's fine.
