@@ -1,40 +1,27 @@
-"""
-stream_analytics_emulator.py
+# Local stand-in for the Azure Stream Analytics job in the build guide (Step 2).
+# Pulls new messages off the iot_hub_emulator queue and fans them out to the same
+# two sinks as the real SAQL query: raw pass-through to Parquet, and a 5-minute
+# tumbling window aggregation (with an anomaly rule) into a SQLite hot path.
+#
+# Two things worth knowing if you're reading this before the README:
+#
+# - Windows aren't finalized until they're a few seconds past their end time
+#   (LATE_ARRIVAL_TOLERANCE_SECONDS below). That's standing in for the "out of
+#   order events" setting a real Stream Analytics job needs - otherwise you
+#   close a window before all its events have actually arrived.
+# - A message missing `vibration` (the simulator does this on purpose sometimes)
+#   still gets written to raw storage as-is. Schema validation happens later, in
+#   orchestrator.py - not here. Keeping the streaming path dumb and pushing
+#   validation into the batch/orchestration layer means a schema check.
+#
+# python stream_analytics_emulator.py --once
+# python stream_analytics_emulator.py --watch --poll 5
 
-Local stand-in for the Azure Stream Analytics job described in the build guide
-(section "Step 2 - Azure Stream Analytics Job"). Reads new messages from the
-iot_hub_emulator queue and fans them out to two sinks, mirroring the two SAQL
-SELECT...INTO statements in the guide:
-
-  1. Raw pass-through -> Parquet, partitioned by date/machine_id (data lake "raw" zone)
-  2. 5-minute tumbling window aggregation + anomaly rule -> SQLite hot path
-     (machine_status + active_alerts tables)
-
-Design notes carried over from the guide (documented here instead of a README so
-they stay next to the code that implements them):
-
-  - Late-arriving events: real Stream Analytics jobs need an explicit "out of order
-    events" tolerance. Here we hold back the most recent (still-open) 5-minute
-    window on each run and only aggregate windows that have fully closed, which is
-    the same idea - don't finalize a window until you're reasonably sure no more
-    events for it are coming.
-  - Malformed events (missing `vibration`, from the simulator's bad_schema
-    injection) are written through to raw storage as-is (with a null vibration)
-    rather than dropped - schema validation is deliberately deferred to the
-    orchestration step (see orchestration/orchestrator.py), matching the real
-    ADF validation-gate design in the guide.
-
-Usage:
-    python stream_analytics_emulator.py --once        # process everything available now
-    python stream_analytics_emulator.py --watch --poll 5   # keep polling every 5s
-"""
 import argparse
 import json
-import os
 import sqlite3
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -50,7 +37,7 @@ CHECKPOINT_FILE = STORAGE_DIR / "checkpoints" / "stream_checkpoint.json"
 
 ANOMALY_VIBRATION_THRESHOLD = 2.0
 ANOMALY_TEMP_THRESHOLD = 95
-LATE_ARRIVAL_TOLERANCE_SECONDS = 5  # mirrors the ASA "out of order events" setting
+LATE_ARRIVAL_TOLERANCE_SECONDS = 5
 
 
 def load_checkpoint():
@@ -99,33 +86,41 @@ def messages_to_dataframe(messages):
             "machine_id": body.get("machine_id") or m.get("device_id"),
             "event_time": body.get("timestamp") or m.get("enqueued_time"),
             "temperature": body.get("temperature"),
-            "vibration": body.get("vibration"),  # may be missing -> NaN, matches ASA passing nulls through
+            "vibration": body.get("vibration"),  # missing on bad-schema events -> NaN
             "rpm": body.get("rpm"),
             "status": body.get("status"),
         })
+
     if not rows:
         return pd.DataFrame(columns=["machine_id", "event_time", "temperature", "vibration", "rpm", "status"])
+
     df = pd.DataFrame(rows)
     df["event_time"] = pd.to_datetime(df["event_time"], utc=True, errors="coerce")
     return df
 
 
-def write_raw_sink(df: pd.DataFrame):
-    """Partition by date/machine_id, one small parquet file per run (append-style, like ASA blob output)."""
+def write_raw_sink(df: pd.DataFrame) -> int:
+    """One small parquet file per machine per run, partitioned by date/machine_id."""
     if df.empty:
         return 0
+
+    # a handful of messages can fail to parse a timestamp - drop them rather than
+    # write them into a nonsense "date=NaT" partition
+    df = df.dropna(subset=["event_time"])
+    if df.empty:
+        return 0
+
     written = 0
     for (date, machine_id), group in df.groupby([df["event_time"].dt.date, "machine_id"]):
         part_dir = RAW_DIR / f"date={date}" / f"machine_id={machine_id}"
         part_dir.mkdir(parents=True, exist_ok=True)
-        fname = part_dir / f"part-{int(time.time()*1000)}.parquet"
-        group.drop(columns=[]).to_parquet(fname, index=False)
+        fname = part_dir / f"part-{int(time.time() * 1000)}.parquet"
+        group.to_parquet(fname, index=False)
         written += len(group)
     return written
 
 
-def compute_tumbling_windows(df: pd.DataFrame, now_utc):
-    """5-minute tumbling window aggregation, holding back the still-open current window."""
+def compute_tumbling_windows(df: pd.DataFrame, now_utc) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
@@ -147,20 +142,23 @@ def compute_tumbling_windows(df: pd.DataFrame, now_utc):
         )
         .reset_index()
     )
-    agg["health_status"] = agg.apply(
-        lambda r: "ALERT" if (pd.notna(r["max_vibration"]) and r["max_vibration"] > ANOMALY_VIBRATION_THRESHOLD)
-        or (pd.notna(r["max_temp"]) and r["max_temp"] > ANOMALY_TEMP_THRESHOLD)
-        else "OK",
-        axis=1,
-    )
+
+    def health_status(row):
+        vib_alert = pd.notna(row["max_vibration"]) and row["max_vibration"] > ANOMALY_VIBRATION_THRESHOLD
+        temp_alert = pd.notna(row["max_temp"]) and row["max_temp"] > ANOMALY_TEMP_THRESHOLD
+        return "ALERT" if (vib_alert or temp_alert) else "OK"
+
+    agg["health_status"] = agg.apply(health_status, axis=1)
     return agg
 
 
 def write_hot_path_sink(conn, agg: pd.DataFrame):
     if agg.empty:
         return 0, 0
+
     rows_written = 0
     alerts_written = 0
+
     for _, r in agg.iterrows():
         conn.execute(
             "INSERT INTO machine_status (machine_id, window_end, avg_temp, max_temp, avg_vibration, max_vibration, health_status) "
@@ -168,11 +166,12 @@ def write_hot_path_sink(conn, agg: pd.DataFrame):
             (r["machine_id"], str(r["window_end"]), r["avg_temp"], r["max_temp"], r["avg_vibration"], r["max_vibration"], r["health_status"]),
         )
         rows_written += 1
+
         if r["health_status"] == "ALERT":
-            existing = conn.execute(
+            already_alerting = conn.execute(
                 "SELECT COUNT(*) FROM active_alerts WHERE machine_id = ? AND resolved = 0", (r["machine_id"],)
             ).fetchone()[0]
-            if existing == 0:
+            if not already_alerting:
                 reason = f"max_vibration={r['max_vibration']:.2f}, max_temp={r['max_temp']:.1f}"
                 conn.execute(
                     "INSERT INTO active_alerts (machine_id, triggered_at, reason) VALUES (?, ?, ?)",
@@ -180,9 +179,8 @@ def write_hot_path_sink(conn, agg: pd.DataFrame):
                 )
                 alerts_written += 1
         else:
-            conn.execute(
-                "UPDATE active_alerts SET resolved = 1 WHERE machine_id = ? AND resolved = 0", (r["machine_id"],)
-            )
+            conn.execute("UPDATE active_alerts SET resolved = 1 WHERE machine_id = ? AND resolved = 0", (r["machine_id"],))
+
     conn.commit()
     return rows_written, alerts_written
 
@@ -199,8 +197,7 @@ def run_once():
     raw_written = write_raw_sink(df)
 
     conn = ensure_hot_path_schema()
-    now_utc = pd.Timestamp.now(tz="UTC")
-    agg = compute_tumbling_windows(df, now_utc)
+    agg = compute_tumbling_windows(df, pd.Timestamp.now(tz="UTC"))
     status_rows, alerts = write_hot_path_sink(conn, agg)
     conn.close()
 
@@ -218,16 +215,17 @@ def main():
     parser.add_argument("--poll", type=float, default=5.0, help="seconds between polls in --watch mode")
     args = parser.parse_args()
 
-    if args.watch:
-        print("Watching for new telemetry... (Ctrl+C to stop)")
-        try:
-            while True:
-                run_once()
-                time.sleep(args.poll)
-        except KeyboardInterrupt:
-            print("\nStopped.")
-    else:
+    if not args.watch:
         run_once()
+        return
+
+    print("Watching for new telemetry... (Ctrl+C to stop)")
+    try:
+        while True:
+            run_once()
+            time.sleep(args.poll)
+    except KeyboardInterrupt:
+        print("\nStopped.")
 
 
 if __name__ == "__main__":

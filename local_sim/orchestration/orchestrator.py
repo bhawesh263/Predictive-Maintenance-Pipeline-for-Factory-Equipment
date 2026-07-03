@@ -1,22 +1,12 @@
-"""
-orchestrator.py
+# Local stand-in for the ADF pipeline `pl_daily_reliability` (build guide, Step 6):
+# check for new raw files, validate their schema (quarantining anything with a
+# missing field - this is where the simulator's bad_schema events actually get
+# caught, since the stream processor lets them through untouched), kick off the
+# batch job, and log the run.
+#
+# python orchestrator.py                        # run once, now
+# python orchestrator.py --schedule --hour 2     # loop forever, run once daily at 2am local time
 
-Local stand-in for the Azure Data Factory pipeline `pl_daily_reliability`
-(build guide, Step 6). Mirrors the same activity sequence:
-
-  1. Get Metadata  - check for raw files that landed since the last run
-  2. If Condition  - skip the run entirely if nothing new landed
-  3. Validation    - schema check: flag/quarantine rows missing required fields
-                      (this is where the simulator's bad_schema events get caught -
-                      they're written through to raw storage untouched by the stream
-                      processor, and caught here instead)
-  4. Databricks Notebook activity -> daily_reliability_job.main()
-  5. Logs the run (files seen, rows quarantined, status) to logs/pipeline_runs.jsonl
-
-Usage:
-    python orchestrator.py            # run once, now
-    python orchestrator.py --schedule --hour 2   # loop forever, run once daily at 2 AM local time
-"""
 import argparse
 import json
 import sys
@@ -38,8 +28,8 @@ LAST_RUN_MARKER = BASE_DIR / "storage" / "checkpoints" / "orchestrator_last_run.
 REQUIRED_FIELDS = ["machine_id", "event_time", "temperature", "vibration", "rpm", "status"]
 
 
-def get_metadata_new_files_since(last_run_iso):
-    """ADF 'Get Metadata' activity equivalent: list raw files modified since last run."""
+def get_new_files_since(last_run_iso):
+    """Stand-in for the ADF 'Get Metadata' activity."""
     if not RAW_DIR.exists():
         return []
     all_files = list(RAW_DIR.rglob("*.parquet"))
@@ -50,8 +40,7 @@ def get_metadata_new_files_since(last_run_iso):
 
 
 def validate_schema(files):
-    """Flags rows missing required fields (e.g. the simulator's dropped-vibration events)
-    and quarantines them instead of letting them silently corrupt downstream aggregates."""
+    """Quarantine any row missing a required field instead of letting it into the daily aggregates."""
     total_rows = 0
     quarantined_rows = 0
     QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
@@ -59,12 +48,14 @@ def validate_schema(files):
     for f in files:
         df = pd.read_parquet(f)
         total_rows += len(df)
-        missing_mask = df[REQUIRED_FIELDS].isna().any(axis=1) if set(REQUIRED_FIELDS).issubset(df.columns) else pd.Series([False] * len(df))
-        bad_rows = df[missing_mask]
+
+        if not set(REQUIRED_FIELDS).issubset(df.columns):
+            continue
+
+        bad_rows = df[df[REQUIRED_FIELDS].isna().any(axis=1)]
         if not bad_rows.empty:
             quarantined_rows += len(bad_rows)
-            qpath = QUARANTINE_DIR / f"{f.stem}_quarantine.parquet"
-            bad_rows.to_parquet(qpath, index=False)
+            bad_rows.to_parquet(QUARANTINE_DIR / f"{f.stem}_quarantine.parquet", index=False)
 
     return total_rows, quarantined_rows
 
@@ -90,18 +81,17 @@ def run_pipeline_once():
     started_at = datetime.now(timezone.utc).isoformat()
     last_run = load_last_run()
 
-    new_files = get_metadata_new_files_since(last_run)
+    new_files = get_new_files_since(last_run)
     if not new_files:
         record = {"started_at": started_at, "status": "skipped_no_new_files", "files_seen": 0}
         log_run(record)
-        print("No new files since last run - skipping (If Condition activity short-circuit).")
+        print("No new files since last run - skipping.")
         return record
 
     total_rows, quarantined_rows = validate_schema(new_files)
-
     daily_reliability_job.main()
-
     save_last_run(started_at)
+
     record = {
         "started_at": started_at,
         "status": "success",

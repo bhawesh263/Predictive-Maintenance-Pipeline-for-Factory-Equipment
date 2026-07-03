@@ -1,32 +1,22 @@
-"""
-iot_hub_emulator.py
+# Local stand-in for Azure IoT Hub device-to-cloud ingestion.
+#
+# Real IoT Hub gives you per-device identity, retries, TLS, throughput limits, etc.
+# This just needs to look enough like it to exercise the rest of the pipeline:
+# devices have to register before they can send, and messages land in an
+# append-only file that downstream readers can checkpoint against.
 
-Local stand-in for Azure IoT Hub's device-to-cloud ingestion.
-
-What it mirrors from the real service:
-  - Per-device identity (a device must be "registered" with a fake key before it can send)
-  - A durable message queue that downstream consumers read from with a consumer-group
-    style checkpoint (so re-running the stream processor doesn't reprocess old messages)
-  - Basic message envelope (content type, timestamp) similar to azure.iot.device.Message
-
-What it does NOT try to emulate: retry/backoff, TLS, real device provisioning, throughput
-quotas. Those are genuine reasons to use IoT Hub in production - see azure/ for the real
-device SDK version of this script.
-"""
 import json
 import os
 import threading
-import time
 from datetime import datetime, timezone
 
-QUEUE_PATH = os.path.join(os.path.dirname(__file__), "..", "storage", "iot_hub_queue.jsonl")
-QUEUE_PATH = os.path.abspath(QUEUE_PATH)
+QUEUE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "storage", "iot_hub_queue.jsonl"))
 
 _lock = threading.Lock()
 
 
 class DeviceRegistry:
-    """Fake device identity store, analogous to `az iot hub device-identity create`."""
+    """Fake device identity store - like `az iot hub device-identity create`, but in memory."""
 
     def __init__(self):
         self._devices = {}
@@ -45,7 +35,7 @@ class IoTHubClient:
 
     def __init__(self, device_id: str, registry: DeviceRegistry):
         if not registry.is_registered(device_id):
-            raise PermissionError(f"device '{device_id}' is not registered - call registry.register() first")
+            raise PermissionError(f"device '{device_id}' isn't registered - call registry.register() first")
         self.device_id = device_id
         os.makedirs(os.path.dirname(QUEUE_PATH), exist_ok=True)
 
@@ -59,19 +49,15 @@ class IoTHubClient:
             "content_type": "application/json",
             "body": payload,
         }
-        with _lock:
-            with open(QUEUE_PATH, "a") as f:
-                f.write(json.dumps(envelope) + "\n")
+        with _lock, open(QUEUE_PATH, "a") as f:
+            f.write(json.dumps(envelope) + "\n")
 
     def disconnect(self):
         return True
 
 
 def read_new_messages(checkpoint_offset: int):
-    """
-    Consumer-group style read: return messages appended after `checkpoint_offset`
-    (a byte offset into the queue file) plus the new offset to persist.
-    """
+    """Return messages appended after checkpoint_offset (a byte offset), plus the new offset."""
     if not os.path.exists(QUEUE_PATH):
         return [], checkpoint_offset
 
@@ -85,6 +71,7 @@ def read_new_messages(checkpoint_offset: int):
             try:
                 messages.append(json.loads(line))
             except json.JSONDecodeError:
+                # half-written line from a concurrent writer - pick it up next poll
                 continue
         new_offset = f.tell()
 

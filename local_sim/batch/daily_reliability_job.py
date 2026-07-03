@@ -1,21 +1,9 @@
-"""
-daily_reliability_job.py (local pandas version)
+# Pandas version of azure/databricks/daily_reliability_job.py - same steps, no
+# Spark cluster needed: read raw parquet, dedup, roll up daily reliability
+# metrics per machine, upsert into a "gold" parquet table.
+#
+# python daily_reliability_job.py
 
-Same logic as azure/databricks/daily_reliability_job.py (the real PySpark + Delta
-Lake job), reimplemented with pandas + parquet so it runs without a Spark cluster:
-
-  1. Read all raw parquet landed by the stream processor
-  2. Dedup: keep the latest reading per machine per minute (handles late/duplicate
-     deliveries, same as the row_number().over(Window...) logic in the Spark version)
-  3. Compute daily reliability metrics per machine (anomaly count, avg temp/vibration,
-     uptime_score)
-  4. Merge/upsert into a gold table (storage/curated/gold_reliability.parquet) -
-     idempotent re-runs, like the Delta `whenMatchedUpdateAll/whenNotMatchedInsertAll`
-     merge in the real job
-
-Usage:
-    python daily_reliability_job.py
-"""
 from pathlib import Path
 
 import pandas as pd
@@ -28,20 +16,21 @@ ANOMALY_TEMP_THRESHOLD = 90
 ANOMALY_VIBRATION_THRESHOLD = 1.8
 
 
-def read_raw():
+def read_raw() -> pd.DataFrame:
     files = list(RAW_DIR.rglob("*.parquet"))
     if not files:
         return pd.DataFrame()
-    frames = [pd.read_parquet(f) for f in files]
-    df = pd.concat(frames, ignore_index=True)
+
+    df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
     df["event_time"] = pd.to_datetime(df["event_time"], utc=True, errors="coerce")
     return df
 
 
 def dedup(df: pd.DataFrame) -> pd.DataFrame:
-    """Keep latest reading per machine per minute bucket."""
+    """Keep the latest reading per machine per minute - handles late/duplicate deliveries."""
     if df.empty:
         return df
+
     df = df.dropna(subset=["event_time", "machine_id"]).copy()
     df["minute_bucket"] = df["event_time"].dt.floor("min")
     df = df.sort_values("event_time", ascending=False)
@@ -50,14 +39,15 @@ def dedup(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_daily_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    columns = ["machine_id", "date", "total_readings", "anomaly_count", "avg_daily_temp", "avg_daily_vibration", "uptime_score"]
     if df.empty:
-        return pd.DataFrame(columns=["machine_id", "date", "total_readings", "anomaly_count",
-                                      "avg_daily_temp", "avg_daily_vibration", "uptime_score"])
+        return pd.DataFrame(columns=columns)
+
     df = df.copy()
     df["date"] = df["event_time"].dt.date.astype(str)
     df["is_anomaly"] = (df["temperature"] > ANOMALY_TEMP_THRESHOLD) | (df["vibration"] > ANOMALY_VIBRATION_THRESHOLD)
 
-    grouped = (
+    daily = (
         df.groupby(["machine_id", "date"])
         .agg(
             total_readings=("machine_id", "size"),
@@ -67,12 +57,12 @@ def compute_daily_metrics(df: pd.DataFrame) -> pd.DataFrame:
         )
         .reset_index()
     )
-    grouped["uptime_score"] = 1 - (grouped["anomaly_count"] / grouped["total_readings"])
-    return grouped
+    daily["uptime_score"] = 1 - (daily["anomaly_count"] / daily["total_readings"])
+    return daily
 
 
 def merge_into_gold(daily_metrics: pd.DataFrame):
-    """Upsert semantics: replace rows for any (machine_id, date) present in the new batch, keep the rest."""
+    """Upsert: any (machine_id, date) in this batch replaces what's already in the gold table."""
     GOLD_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     if daily_metrics.empty:
@@ -81,8 +71,9 @@ def merge_into_gold(daily_metrics: pd.DataFrame):
 
     if GOLD_PATH.exists():
         existing = pd.read_parquet(GOLD_PATH)
-        keys = set(zip(daily_metrics["machine_id"], daily_metrics["date"]))
-        existing = existing[~existing.apply(lambda r: (r["machine_id"], r["date"]) in keys, axis=1)]
+        stale = pd.MultiIndex.from_frame(existing[["machine_id", "date"]])
+        incoming = pd.MultiIndex.from_frame(daily_metrics[["machine_id", "date"]])
+        existing = existing[~stale.isin(incoming)]
         merged = pd.concat([existing, daily_metrics], ignore_index=True)
     else:
         merged = daily_metrics

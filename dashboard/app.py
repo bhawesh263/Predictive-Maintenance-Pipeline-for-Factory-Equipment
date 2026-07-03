@@ -1,20 +1,9 @@
-"""
-app.py
+# Local stand-in for the Power BI dashboard (build guide, Step 7). Reads from the
+# same two sinks a real Power BI report would connect to: the SQLite hot path for
+# live status/alerts, and the gold parquet table for daily trends.
+#
+# streamlit run app.py
 
-Local stand-in for the Power BI dashboard described in the build guide (Step 7).
-Reads from the same two sinks a real Power BI report would connect to:
-
-  - SQLite hot path (machine_status, active_alerts) -> live/hot view
-  - Gold Delta/parquet table (curated/gold_reliability.parquet) -> daily trends
-
-Panels:
-  1. Machine status grid - one tile per machine, color-coded by latest health_status
-  2. Alert feed - active_alerts, most recent first
-  3. Daily downtime-risk trend - uptime_score per machine over time
-
-Run:
-    streamlit run app.py
-"""
 import sqlite3
 from pathlib import Path
 
@@ -27,7 +16,7 @@ GOLD_PATH = BASE_DIR / "storage" / "curated" / "gold_reliability.parquet"
 
 st.set_page_config(page_title="Factory Reliability Dashboard", layout="wide")
 st.title("🏭 Predictive Maintenance Dashboard")
-st.caption("Local emulation of the Power BI report - same sinks (hot-path SQL + curated Delta table), different renderer.")
+st.caption("Local emulation of the Power BI report - same data sinks, different renderer.")
 
 if st.button("🔄 Refresh"):
     st.rerun()
@@ -49,12 +38,9 @@ else:
     cols = st.columns(min(len(latest), 6) or 1)
     for i, (_, row) in enumerate(latest.sort_values("machine_id").iterrows()):
         color = "🔴" if row["health_status"] == "ALERT" else "🟢"
+        delta = f"{row['avg_temp']:.1f}°C / vib {row['avg_vibration']:.2f}" if pd.notna(row["avg_vibration"]) else f"{row['avg_temp']:.1f}°C"
         with cols[i % len(cols)]:
-            st.metric(
-                label=f"{color} {row['machine_id']}",
-                value=row["health_status"],
-                delta=f"{row['avg_temp']:.1f}°C / vib {row['avg_vibration']:.2f}" if pd.notna(row["avg_vibration"]) else f"{row['avg_temp']:.1f}°C",
-            )
+            st.metric(label=f"{color} {row['machine_id']}", value=row["health_status"], delta=delta)
 
 st.header("Alert Feed")
 if alerts_df.empty:
