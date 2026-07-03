@@ -1,0 +1,32 @@
+-- Raw pass-through to Data Lake (partitioned by date via output path config)
+SELECT
+    machine_id,
+    EventEnqueuedUtcTime AS event_time,
+    temperature,
+    vibration,
+    rpm,
+    status
+INTO
+    [datalake-output]
+FROM
+    [iothub-input]
+
+-- Windowed aggregation + anomaly detection to SQL hot path
+SELECT
+    machine_id,
+    System.Timestamp() AS window_end,
+    AVG(temperature) AS avg_temp,
+    MAX(temperature) AS max_temp,
+    AVG(vibration) AS avg_vibration,
+    MAX(vibration) AS max_vibration,
+    CASE
+        WHEN MAX(vibration) > 2.0 OR MAX(temperature) > 95 THEN 'ALERT'
+        ELSE 'OK'
+    END AS health_status
+INTO
+    [sql-output]
+FROM
+    [iothub-input]
+GROUP BY
+    machine_id,
+    TumblingWindow(minute, 5)
